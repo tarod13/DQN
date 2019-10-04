@@ -140,10 +140,8 @@ class System:
         self.render = render
         self.store_video = store_video
         self.reset_when_done = reset_when_done
-        self.epsd_counter = 0
-
+        
         self.buffer_size = 4
-        self.M = 5
         self.frames_to_skip = 3
         self.max_steps = 50000
         self.step = 0
@@ -175,7 +173,6 @@ class System:
 
     def preprocess(self, images):
         return (255*self.crop(self.grayscale_downsample(images))).byte()
-
     
     def initialize_history(self, state):
         preprocessed_state = self.preprocess(state)
@@ -193,241 +190,73 @@ class System:
         return observation
 
     def reset(self, change_env=False):        
-        if self.embedded_envs:
-            if self.env_names[self.task] == 'Pendulum-v0' and self.hard_start:
-                self.envs[self.task].state = np.array([-np.pi,0.0])
-            else:
-                self.envs[self.task].reset()
-                self.task = self.envs[0]._task
-        else:
-            if change_env:
-                self.task = (self.task+1) % self.task_modulo
-            if self.env_names[self.task] == 'Pendulum-v0' and self.hard_start:
-                self.envs[self.task].state = np.array([-np.pi,0.0])
-            else:
-                self.envs[self.task].reset()
-            self.agent.reset_upper_level()
-    
-    def get_obs(self):
-        if self.original_state:
-            state = self.envs[self.task]._get_obs().copy()
-        else:
-            if self.env_names[self.task] == 'Pendulum-v0':            
-                state = self.envs[self.task].state.copy().reshape(-1) 
-                state[0] = normalize_angle(state[0])
-            elif self.env_names[self.task] == 'Ant-v3':
-                state = self.envs[self.task]._get_obs()[:28]
-        return state
-
-    def initialization(self):         
-        self.reset()
-        self.epsd_counter += 1
-        average_r = 0.0
-        epsd_step = 0
-        for init_step in range(0, self.init_steps):
-            epsd_step += 1           
-            event = self.interaction_init(epsd_step)
-            r = event[self.sa_dim]
-            done = event[self.sars_dim]
-            average_r += (r-average_r)/(init_step+1)
-            if done:
-                epsd_step = 0
-            if self.render:
-                self.envs[self.task].render()                        
-        print("Finished initialization, av. reward = %.4f" % (average_r))
-
-    def interaction_init(self, epsd_step):  
-        event = np.empty(self.t_dim)
-        state = self.get_obs()
-        action, action_llhood = self.agent.act(state, self.task, explore=True)
-        scaled_action = scale_action(action, self.min_action, self.max_action).reshape(-1)
-        _, reward, done, info = self.envs[self.task].step(scaled_action)  
-        done = done and self.reset_when_done
-        next_state = self.get_obs()
-        if done:
-            self.reset(change_env=True)                   
-        
-        event[:self.s_dim] = state
-        event[self.s_dim:self.sa_dim] = action
-        event[self.sa_dim] = reward
-        event[self.sa_dim+1:self.sars_dim] = next_state
-        event[self.sars_dim] = float(done)
-        event[self.sarsd_dim+1] = self.task
-        
-        if self.n_tasks > 1 or self.embedded_envs:
-            event[self.sarsd_dim] = info['reward_goal']  
-        else:
-            event[self.sarsd_dim] = reward
-        self.agent.collect_reward(event[self.sarsd_dim], done, self.task, epsd_step>=self.envs[self.task]._max_episode_steps, state, action, action_llhood)    
-        
-        self.agent.memorize(event)   
-        return event
-
-    def interaction(self, learn=True, remember=True, init=False, explore=True, epsd_step=0):  
-        event = np.empty(self.t_dim)
-        state = self.get_obs()
-
-        for env_step in range(0, self.env_steps):
-            action, action_llhood = self.agent.act(state, self.task, explore=explore)
-            scaled_action = scale_action(action, self.min_action, self.max_action).reshape(-1)
-            _, reward, done, info = self.envs[self.task].step(scaled_action)
-            # if (epsd_step*self.env_steps+1) >= 1000:
-            #     print("Done "+str(done))
-            done = done and self.reset_when_done # must be changed if done == True when time == max_time
-            next_state = self.get_obs()                            
-
-            event[:self.s_dim] = state
-            event[self.s_dim:self.sa_dim] = action
-            event[self.sa_dim] = reward
-            event[self.sa_dim+1:self.sars_dim] = next_state
-            event[self.sars_dim] = float(done)
-            event[self.sarsd_dim+1] = self.task
-        
-            if self.n_tasks > 1 or self.embedded_envs:
-                event[self.sarsd_dim] = info['reward_goal']                  
-            else:
-                event[self.sarsd_dim] = reward    
-            
-            if remember:
-                self.agent.memorize(event)
-
-            if remember and (self.hierarchical or self.n_tasks > 1 or self.embedded_envs):
-                self.agent.collect_reward(event[self.sarsd_dim], done, self.task, (epsd_step*self.env_steps+env_step+1)>=self.envs[self.task]._max_episode_steps, state, action, action_llhood)
-
-            if done:
-                self.reset(change_env=True)
-                break
-
-            if env_step < self.env_steps-1:
-                state = np.copy(next_state)
-        
-        if learn and not init:
-            for _ in range(0, self.grad_steps):
-                self.agent.learn()
-
-        return event, done
-    
-    def train_agent(self, tr_epsds, epsd_steps, initialization=True, eval_epsd_interval=10, eval_epsds=12, iter_=0, save_progress=True, common_path='', rewards=[], goal_rewards=[], metrics=[]):        
+        self.env.reset()
+       
+    def train_agent(self, tr_epsds, epsd_steps, eval_epsd_interval=10, eval_epsds=12, iter_=0, save_progress=True, common_path='', rewards=[], metrics=[]):        
         if self.render:
-            self.envs[self.task].render()
+            self.env.render()
 
-        if initialization:
-            self.initialization()
-
-        n_done = 0
-        # rewards = []
-        # if self.n_tasks > 1 or self.embedded_envs:
-        #     goal_rewards = []
-
+        losses = []
+        rewards = []
         for epsd in range(0, tr_epsds):
-            self.epsd_counter += 1
-            if epsd == 0:
-                self.reset(change_env=False)
-            else:
-                self.reset(change_env=True)
-            
+            state = self.env.reset()
+            observation = self.initialize_history(state)
+            frames_skipped = 0
+            action = 0
+            epsd_losses = []
+
             for epsd_step in range(0, epsd_steps):
-                if len(self.agent.memory.data) < self.batch_size:
-                    done = self.interaction(learn=False, epsd_step=epsd_step)[1]
-                else:
-                    done = self.interaction(learn=True, epsd_step=epsd_step)[1]
+                if frames_skipped % (self.frames_to_skip + 1) == 0:
+                    action = self.agent.act(observation)
+                next_state, reward, done, info = self.env.step(action)
 
                 if self.render:
-                    self.envs[self.task].render()
+                    self.env.render()
+
+                if frames_skipped % (self.frames_to_skip + 1) == 0:
+                    next_observation = self.write_history(next_state)            
+                    experience = [observation, action, reward, next_observation, done]
+                    self.agent.remember(experience)
+                    loss = self.agent.learn()            
+                    epsd_losses.append(loss)
+
+                    stdout.write("Epsd %i, step %i, loss: %.4f" % (epsd+1, epsd_step+1, loss))
 
                 if done:
-                    n_done += 1
+                    self.history_buffer = []
+                    break
                 
-                if n_done >= 5:
-                    self.eval_agent(1, act_randomly=False, iter_=iter_, print_space=False)
-                    self.reset(change_env=False)
-                    n_done = 0
-            
+                frames_skipped += 1
+
+            losses.append(epsd_losses)
+            if save_progress:
+                pickle.dump(losses, open(common_path+'/losses.p','wb'))              
+                
             if (epsd+1) % eval_epsd_interval == 0:
-                if self.hierarchical:
-                    if self.n_tasks > 1 or self.embedded_envs:
-                        r, gr, _, m = self.eval_agent(eval_epsds, act_randomly=False, iter_=iter_ + (epsd+1) // eval_epsd_interval)
-                        goal_rewards.append(gr)
-                        if save_progress:
-                            np.savetxt(common_path + '/mean_rewards_goal.txt', np.array(goal_rewards))
-                    else:
-                        r, _, m = self.eval_agent(eval_epsds, act_randomly=False, iter_=iter_ + (epsd+1) // eval_epsd_interval)
-                    metrics.append(m)
-                    if save_progress:
-                        np.savetxt(common_path + '/metrics.txt', np.array(metrics))
-                else:
-                    if self.n_tasks > 1 or self.embedded_envs:
-                        r, gr = self.eval_agent(eval_epsds, act_randomly=False, iter_=iter_ + (epsd+1) // eval_epsd_interval)[:2]
-                        goal_rewards.append(gr)
-                        if save_progress:
-                            np.savetxt(common_path + '/mean_rewards_goal.txt', np.array(goal_rewards))
-                    else:
-                        rewards.append(self.eval_agent(eval_epsds, act_randomly=False, iter_=iter_ + (epsd+1) // eval_epsd_interval)[0])
-                rewards.append(r)
-                self.reset(change_env=False)
+                rewards.append(self.eval_agent(eval_epsds, act_randomly=False, iter_=iter_ + (epsd+1) // eval_epsd_interval)[0])
                 if save_progress:
                     specific_path = common_path + '/' + str(iter_ + (epsd+1) // eval_epsd_interval)
                     self.save(common_path, specific_path)
                     np.savetxt(common_path + '/mean_rewards.txt', np.array(rewards))
               
-        if self.n_tasks > 1 or self.embedded_envs:
-            return np.array(rewards).reshape(-1), np.array(goal_rewards).reshape(-1)
-        else:      
-            return np.array(rewards).reshape(-1)      
+        return np.array(rewards).reshape(-1), losses      
     
-
     def eval_agent(self, eval_epsds, act_randomly=False, iter_=0, start_render=False, print_space=True):   
         if start_render:
-            self.envs[self.task].render()
+            self.env.render()
           
         if self.store_video:
-            if self.env_names[self.task] == 'Pendulum-v0':
-                video = VideoWriter('./'+self.env_names[self.task]+'_test_'+str(iter_)+'.avi', fourcc, float(FPS), (500, 500))
-            else:
-                video = VideoWriter('./'+self.env_names[self.task]+'_test_'+str(iter_)+'.avi', fourcc, float(FPS), (width, height))          
+            video = VideoWriter('./'+self.env_name+'_test_'+str(iter_)+'.avi', fourcc, float(FPS), (width, height))          
         
         events = []
         rewards = []
         min_epsd_reward = 1e6
         max_epsd_reward = -1e6
-        
-        if self.n_tasks > 1 or self.embedded_envs:
-            goal_rewards = [] 
-            min_epsd_goal_reward = 1e6
-            max_epsd_goal_reward = -1e6
-        
-        if self.hierarchical:
-            uniques = []
-            HS = []
-            HS_s = []
-            ISs = []
-            Ha_s = []
-            Ha_As = []
-            HnS_AT = []
-            HnS_SAT = []
-            InSS_AT = []
-            HR_ST = []
-            HR_T = []
-            IRS_T = []
-            unique_average = 0
-            HS_average = 0
-            HS_s_average = 0
-            ISs_average = 0
-            HR_ST_average = 0
-            HR_T_average = 0
-            IRS_T_average = 0
-            InSS_AT_average = 0
-            Ha_s_average = 0
-            Ha_As_average = 0
-            HnS_AT_average = 0
-            HnS_SAT_average = 0
-
         done = False
+        
         for epsd in range(0, eval_epsds):
             epsd_reward = 0.0
-            if self.n_tasks > 1 or self.embedded_envs:
-                epsd_goal_reward = 0.0            
-
+            
             self.reset(change_env=not done)
             
             for eval_step in itertools.count(0):            
