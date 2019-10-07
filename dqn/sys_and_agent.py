@@ -75,24 +75,27 @@ class Agent:
     
     def learn(self, batch_size=32):
         transition_batch = self.replay_buffer.sample_transitions(batch_size)
-        transition_batch = list(map(list, zip(*transition_batch)))
-        observations = torch.stack(transition_batch[0]).float().to(device)
-        actions = np.array(transition_batch[1])
-        rewards = torch.FloatTensor(transition_batch[2]).view(-1,1).to(device)
-        next_observations = torch.stack(transition_batch[3]).float().to(device)
-        dones = torch.FloatTensor(transition_batch[4]).view(-1,1).to(device)
 
-        q_values = (self.q_network(observations)[np.arange(observations.size(0)), actions]).view(-1,1)
-        next_q_values = (self.q_network(next_observations).max(1)[0]).view(-1,1)
-        targets = rewards  +  self.discount_factor * (1-dones) * next_q_values
+        if len(transition_batch) > 0:
+            observations = torch.stack(transition_batch[0]).float().to(device)
+            actions = np.array(transition_batch[1])
+            rewards = torch.FloatTensor(transition_batch[2]).view(-1,1).to(device)
+            next_observations = torch.stack(transition_batch[3]).float().to(device)
+            dones = torch.FloatTensor(transition_batch[4]).view(-1,1).to(device)
 
-        q_loss = self.q_network.loss_func(q_values, targets.detach())
-        self.q_network.optimizer.zero_grad()
-        q_loss.backward()
-        clip_grad_norm_(self.q_network.parameters(), self.clip_grad_norm_value)
-        self.q_network.optimizer.step()
+            q_values = (self.q_network(observations)[np.arange(observations.size(0)), actions]).view(-1,1)
+            next_q_values = (self.q_network(next_observations).max(1)[0]).view(-1,1)
+            targets = rewards  +  self.discount_factor * (1-dones) * next_q_values
 
-        return q_loss
+            q_loss = self.q_network.loss_func(q_values, targets.detach())
+            self.q_network.optimizer.zero_grad()
+            q_loss.backward()
+            clip_grad_norm_(self.q_network.parameters(), self.clip_grad_norm_value)
+            self.q_network.optimizer.step()
+
+            return q_loss
+        else:
+            return 0.0
     
     def save(self, common_path, specific_path):
         pickle.dump(self.memory,open(common_path+'/memory.p','wb'))
@@ -175,6 +178,7 @@ class System:
         return (255*self.crop(self.grayscale_downsample(images))).byte()
     
     def initialize_history(self, state):
+        self.history_buffer = []
         preprocessed_state = self.preprocess(state)
         for _ in range(0, self.buffer_size):
             self.history_buffer.append(preprocessed_state.clone())
@@ -192,7 +196,7 @@ class System:
     def reset(self, change_env=False):        
         self.env.reset()
        
-    def train_agent(self, tr_epsds, epsd_steps, eval_epsd_interval=10, eval_epsds=12, iter_=0, save_progress=True, common_path='', rewards=[], metrics=[]):        
+    def train_agent(self, tr_epsds, epsd_steps, eval_epsd_interval=10, eval_epsds=12, iter_=0, save_progress=True, common_path='', rewards=[]):        
         if self.render:
             self.env.render()
 
@@ -204,29 +208,30 @@ class System:
             frames_skipped = 0
             action = 0
             epsd_losses = []
+            cumulative_reward = 0.0
 
             for epsd_step in range(0, epsd_steps):
                 if frames_skipped % (self.frames_to_skip + 1) == 0:
                     action = self.agent.act(observation)
                 next_state, reward, done, info = self.env.step(action)
+                cumulative_reward += reward
+                frames_skipped += 1
 
                 if self.render:
                     self.env.render()
 
                 if frames_skipped % (self.frames_to_skip + 1) == 0:
                     next_observation = self.write_history(next_state)            
-                    experience = [observation, action, reward, next_observation, done]
+                    experience = [observation, action, cumulative_reward, next_observation, done]
                     self.agent.remember(experience)
                     loss = self.agent.learn()            
                     epsd_losses.append(loss)
+                    cumulative_reward = 0.0
 
                     stdout.write("Epsd %i, step %i, loss: %.4f" % (epsd+1, epsd_step+1, loss))
 
                 if done:
-                    self.history_buffer = []
                     break
-                
-                frames_skipped += 1
 
             losses.append(epsd_losses)
             if save_progress:
@@ -248,7 +253,6 @@ class System:
         if self.store_video:
             video = VideoWriter('./'+self.env_name+'_test_'+str(iter_)+'.avi', fourcc, float(FPS), (width, height))          
         
-        events = []
         rewards = []
         min_epsd_reward = 1e6
         max_epsd_reward = -1e6
@@ -256,112 +260,53 @@ class System:
         
         for epsd in range(0, eval_epsds):
             epsd_reward = 0.0
-            
-            self.reset(change_env=not done)
-            
+            state = self.env.reset()
+            observation = self.initialize_history(state)
+            frames_skipped = 0
+            action = 0
+            cumulative_reward = 0.0
+            self.history_buffer = []
+
             for eval_step in itertools.count(0):            
-                event = self.interaction(learn=False, explore=act_randomly, remember=False, epsd_step=eval_step)[0]                
+                if frames_skipped % (self.frames_to_skip + 1) == 0:
+                    action = self.agent.act(observation)
+                next_state, reward, done, info = self.env.step(action)
+                cumulative_reward += reward
+                frames_skipped += 1
 
                 if self.store_video:
-                    if self.env_names[self.task] == 'Pendulum-v0':
-                        img = self.envs[self.task].render('rgb_array')
-                    else:
-                        img = self.envs[self.task].render('rgb_array',1024,768)
+                    img = self.env.render('rgb_array',1024,768)
                     video.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
                 if self.render:
-                    self.envs[self.task].render()   
+                    self.env.render()   
 
-                r = event[self.sa_dim]
-                if self.n_tasks > 1 or self.embedded_envs:
-                    R = event[self.sarsd_dim]
-                done = event[self.sars_dim]
+                epsd_reward += reward
+                if frames_skipped % (self.frames_to_skip + 1) == 0:
+                    next_observation = self.write_history(next_state)            
+                    experience = [observation, action, reward, next_observation, done]
+                    self.agent.remember(experience)
+                    cumulative_reward = 0.0
 
-                epsd_reward += r
-                if self.n_tasks > 1 or self.embedded_envs:
-                    epsd_goal_reward += R
-                events.append(event)
-
-                if done or (eval_step + 1 >= self.envs[self.task]._max_episode_steps):
+                if done or (eval_step + 1 >= self.env._max_episode_steps):
                     break               
 
-            if self.hierarchical:
-                metrics = self.agent.learn(only_metrics=True)
-                uniques.append(metrics['n concepts'])
-                HS.append(metrics['H(S)'])
-                HS_s.append(metrics['H(S|s)'])
-                ISs.append(metrics['I(S:s)'])
-                Ha_s.append(metrics['H(a|s)'])
-                Ha_As.append(metrics['H(a|A,s)'])
-                HnS_AT.append(metrics['H(nS|A,T)'])
-                HnS_SAT.append(metrics['H(nS|S,A,T)'])
-                InSS_AT.append(metrics['I(nS:S|A,T)'])
-                HR_ST.append(metrics['H(R|S,T)'])
-                HR_T.append(metrics['H(R|T)'])
-                IRS_T.append(metrics['I(R:S|T)'])
-           
             rewards.append(epsd_reward)
             min_epsd_reward = np.min([epsd_reward, min_epsd_reward])
             max_epsd_reward = np.max([epsd_reward, max_epsd_reward])
             average_reward = np.array(rewards).mean()  
 
-            if self.n_tasks > 1 or self.embedded_envs:
-                goal_rewards.append(epsd_goal_reward)            
-                min_epsd_goal_reward = np.min([epsd_goal_reward, min_epsd_goal_reward])
-                max_epsd_goal_reward = np.max([epsd_goal_reward, max_epsd_goal_reward])           
-                average_goal_reward = np.array(goal_rewards).mean()
-
-            if self.hierarchical:
-                unique_average += (uniques[-1] - unique_average)/(epsd+1)
-                ISs_average += (ISs[-1] - ISs_average)/(epsd+1)
-                HR_ST_average += (HR_ST[-1] - HR_ST_average)/(epsd+1)
-                HR_T_average += (HR_T[-1] - HR_T_average)/(epsd+1)
-                IRS_T_average += (IRS_T[-1] - IRS_T_average)/(epsd+1)
-                InSS_AT_average += (InSS_AT[-1] - InSS_AT_average)/(epsd+1)
-                HS_average += (HS[-1] - HS_average)/(epsd+1)
-                HS_s_average += (HS_s[-1] - HS_s_average)/(epsd+1)
-                Ha_s_average += (Ha_s[-1] - Ha_s_average)/(epsd+1)
-                Ha_As_average += (Ha_As[-1] - Ha_As_average)/(epsd+1)
-                HnS_AT_average += (HnS_AT[-1] - HnS_AT_average)/(epsd+1)
-                HnS_SAT_average += (HnS_SAT[-1] - HnS_SAT_average)/(epsd+1)
-
-            if self.hierarchical and (self.n_tasks > 1 or self.embedded_envs):
-                stdout.write("Iter %i, epsd %i, u: %.2f, I(s:S): %.4f, I(r:S):%.3f, I(nS:S): %.4f, min r: %.1f, max r: %.1f, mean r: %.2f, epsd r: %.1f, min R: %.1f, max R: %.1f, mean R: %.2f, epsd R: %.1f\r " %
-                    (iter_, (epsd+1), unique_average, ISs_average, IRS_T_average, InSS_AT_average, min_epsd_reward, max_epsd_reward, average_reward, epsd_reward, 
-                        min_epsd_goal_reward, max_epsd_goal_reward, average_goal_reward, epsd_goal_reward))
-                stdout.flush() 
-            elif self.hierarchical and not (self.n_tasks > 1 or self.embedded_envs):
-                stdout.write("Iter %i, epsd %i, u: %.2f, I(s:S): %.4f, I(r:S):%.3f, I(nS:S): %.4f, min r: %.1f, max r: %.1f, mean r: %.2f, epsd r: %.1f\r " %
-                    (iter_, (epsd+1), unique_average, ISs_average, IRS_T_average, InSS_AT_average, min_epsd_reward, max_epsd_reward, average_reward, epsd_reward))
-                stdout.flush()
-            elif not self.hierarchical and (self.n_tasks > 1 or self.embedded_envs):
-                stdout.write("Iter %i, epsd %i, min r: %.1f, max r: %.1f, mean r: %.2f, epsd r: %.1f, min R: %.1f, max R: %.1f, mean R: %.2f, epsd R: %.1f\r " %
-                    (iter_, (epsd+1), min_epsd_reward, max_epsd_reward, average_reward, epsd_reward, min_epsd_goal_reward, max_epsd_goal_reward, average_goal_reward, epsd_goal_reward))
-                stdout.flush()
-            else:
-                stdout.write("Iter %i, epsd %i, min r: %.1f, max r: %.1f, mean r: %.2f, epsd r: %.1f\r " %
-                    (iter_, (epsd+1), min_epsd_reward, max_epsd_reward, average_reward, epsd_reward))
-                stdout.flush()            
+            stdout.write("Iter %i, epsd %i, min r: %.1f, max r: %.1f, mean r: %.2f, epsd r: %.1f\r " %
+                (iter_, (epsd+1), min_epsd_reward, max_epsd_reward, average_reward, epsd_reward))
+            stdout.flush()            
 
         if print_space:    
             print("")
             
         if self.store_video:
             video.release()
-        # if self.render:
-        #     self.envs[self.task].close()   
 
-        if self.hierarchical:
-            metric_vector = np.array([Ha_As_average, HS_average, HS_s_average, ISs_average, unique_average, HnS_AT_average, HnS_SAT_average, InSS_AT_average, HR_ST_average, HR_T_average, IRS_T_average, Ha_s_average, Ha_s_average-Ha_As_average]) 
-            if self.n_tasks > 1 or self.embedded_envs:
-                return rewards, goal_rewards, np.array(events), metric_vector
-            else:
-                return rewards, np.array(events), metric_vector
-        else:
-            if self.n_tasks > 1 or self.embedded_envs:
-                return rewards, goal_rewards, np.array(events)
-            else:
-                return rewards, np.array(events)
+        return rewards
     
     def save(self, common_path, specific_path):
         self.agent.save(common_path, specific_path)
